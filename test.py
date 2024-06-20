@@ -1,101 +1,127 @@
+import os
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 import torchaudio
-from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
-from datasets import load_dataset, Audio
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import numpy as np
 
-# Load your dataset (example using a hypothetical dataset)
-dataset = load_dataset('your_dataset_name', split='train')
+# Define the path to the dataset
+DATASET_PATH = 'snore_dataset'
 
-# Determine the number of unique labels
-num_labels = len(set(dataset['label']))
+# Function to load the .wav files and their labels using torchaudio
+def load_data(dataset_path):
+    data = []
+    labels = []
 
-print(f"Number of labels: {num_labels}")
+    for label in ['0', '1']:
+        class_path = os.path.join(dataset_path, label)
+        for filename in os.listdir(class_path):
+            if filename.endswith('.wav'):
+                filepath = os.path.join(class_path, filename)
+                waveform, sample_rate = torchaudio.load(filepath)
+                data.append(waveform.mean(dim=0).numpy())  # Convert stereo to mono if necessary
+                labels.append(int(label))
+    
+    return data, labels
 
-# Load the pre-trained processor and model
-processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-model = Wav2Vec2ForSequenceClassification.from_pretrained("facebook/wav2vec2-base-960h", num_labels=num_labels)
+# Custom Dataset class
+class SnoreDataset(Dataset):
+    def __init__(self, data, labels):
+        self.data = data
+        self.labels = labels
 
-# Ensure the audio data is loaded correctly
-dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    def __len__(self):
+        return len(self.data)
 
-# Preprocess the dataset
-def preprocess_function(examples):
-    audio = examples["audio"]
-    inputs = processor(audio["array"], sampling_rate=audio["sampling_rate"], return_tensors="pt", padding=True)
-    inputs["labels"] = examples["label"]
-    return inputs
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        label = self.labels[idx]
+        return torch.tensor(sample, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
 
-# Apply the preprocessing function to the dataset
-encoded_dataset = dataset.map(preprocess_function, remove_columns=["audio"], batched=True)
+# Load data
+data, labels = load_data(DATASET_PATH)
 
-# Create PyTorch DataLoader
-from torch.utils.data import DataLoader
+# Pad sequences to the same length
+max_length = max(len(sample) for sample in data)
+data = [np.pad(sample, (0, max_length - len(sample)), 'constant') for sample in data]
 
-train_loader = DataLoader(encoded_dataset, batch_size=8, shuffle=True)
+# Normalize the data safely
+data = np.array(data)
+data_max = np.max(np.abs(data), axis=1, keepdims=True)
+data_max[data_max == 0] = 1  # Avoid division by zero
+data = data / data_max
 
-# Define the Training Loop
-from torch.optim import AdamW
-from torch.nn import CrossEntropyLoss
-from tqdm import tqdm
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(data, labels, test_size=0.2, random_state=42)
 
-# Move model to the appropriate device (GPU if available)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
+# Create PyTorch datasets and dataloaders
+train_dataset = SnoreDataset(X_train, y_train)
+test_dataset = SnoreDataset(X_test, y_test)
 
-# Define the optimizer and loss function
-optimizer = AdamW(model.parameters(), lr=5e-5)
-criterion = CrossEntropyLoss()
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+
+# Define a simple 1D CNN model with LeakyReLU and logits output
+class CNN1D(nn.Module):
+    def __init__(self):
+        super(CNN1D, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=16, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.pool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        self.conv2 = nn.Conv1d(in_channels=16, out_channels=32, kernel_size=7, stride=2, padding=3)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.fc1 = nn.Linear(32 * (max_length // 16), 64)
+        self.fc2 = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)  # Add channel dimension
+        x = self.pool(F.leaky_relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.leaky_relu(self.bn2(self.conv2(x))))
+        x = x.view(x.size(0), -1)
+        x = F.leaky_relu(self.fc1(x))
+        x = self.fc2(x)  # Logits output
+        return x
+
+# Initialize model, loss function, and optimizer
+model = CNN1D()
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # Training loop
-num_epochs = 3  # Set the number of epochs
+num_epochs = 10
+model.train()
+
 for epoch in range(num_epochs):
-    model.train()
     running_loss = 0.0
-    for batch in tqdm(train_loader):
-        # Move inputs and labels to device
-        inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
-        labels = batch["labels"].to(device)
-        
-        # Forward pass
-        outputs = model(**inputs)
-        loss = criterion(outputs.logits, labels)
-        
-        # Backward pass
+    for inputs, labels in train_loader:
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        labels = labels.float().unsqueeze(1)  # Match the output shape
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
-        
-        running_loss += loss.item()
+        running_loss += loss.item() * inputs.size(0)
     
-    avg_loss = running_loss / len(train_loader)
-    print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss:.4f}")
+    epoch_loss = running_loss / len(train_loader.dataset)
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
 
-# Evaluate the Model
-# Load the validation/test set (example using a hypothetical dataset)
-test_dataset = load_dataset('your_dataset_name', split='test')
-test_dataset = test_dataset.cast_column("audio", Audio(sampling_rate=16000))
-encoded_test_dataset = test_dataset.map(preprocess_function, remove_columns=["audio"], batched=True)
-test_loader = DataLoader(encoded_test_dataset, batch_size=8)
-
-# Evaluation loop
+# Evaluation
 model.eval()
 correct = 0
 total = 0
+
 with torch.no_grad():
-    for batch in test_loader:
-        # Move inputs and labels to device
-        inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
-        labels = batch["labels"].to(device)
-        
-        # Forward pass
-        outputs = model(**inputs)
-        _, predicted = torch.max(outputs.logits, 1)
+    for inputs, labels in test_loader:
+        outputs = model(inputs)
+        predicted = (torch.sigmoid(outputs) > 0.5).int()  # Use sigmoid to get probabilities
         total += labels.size(0)
-        correct += (predicted == labels).sum().item()
+        correct += (predicted.squeeze() == labels).sum().item()
 
 accuracy = correct / total
-print(f"Accuracy: {accuracy:.4f}")
+print(f"Test Accuracy: {accuracy * 100:.2f}%")
 
-# Save the Fine-Tuned Model
-model.save_pretrained("path_to_save_your_model")
-processor.save_pretrained("path_to_save_your_model")
+# Save the model
+torch.save(model.state_dict(), 'snore_detection_model.pth')
